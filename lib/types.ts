@@ -26,6 +26,9 @@ export interface UserProfile {
   email: string | null;
   displayName: string | null;
   photoURL?: string | null;
+  provider?: "google.com" | "password" | "demo";
+  createdAt?: string;
+  lastLoginAt?: string;
   isDemo?: boolean;
 }
 

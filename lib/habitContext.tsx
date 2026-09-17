@@ -10,15 +10,15 @@ import {
   createUserWithEmailAndPassword, 
   signInWithPopup, 
   signOut, 
-  updateProfile 
+  updateProfile,
+  sendPasswordResetEmail
 } from "firebase/auth";
 import { 
   collection, 
   doc, 
   getDocs, 
   setDoc, 
-  deleteDoc, 
-  onSnapshot 
+  deleteDoc 
 } from "firebase/firestore";
 
 interface HabitContextType {
@@ -36,6 +36,7 @@ interface HabitContextType {
   setDayMoodAndTags: (date: string, mood?: string, tags?: string[]) => Promise<void>;
   loginWithEmail: (email: string, pass: string) => Promise<void>;
   signupWithEmail: (email: string, pass: string, name: string) => Promise<void>;
+  sendPasswordReset: (email: string) => Promise<void>;
   loginWithGoogle: () => Promise<void>;
   loginAsDemo: (name?: string) => void;
   logout: () => Promise<void>;
@@ -54,23 +55,51 @@ export const HabitProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [logs, setLogs] = useState<Record<string, DayLog>>({});
   const [selectedDate, setSelectedDate] = useState<string>(getTodayStr());
 
+  // Helper to persist user record into Firestore users collection table
+  const saveUserProfileToFirestore = async (profile: UserProfile) => {
+    if (!db || profile.isDemo) return;
+    try {
+      await setDoc(
+        doc(db, "users", profile.uid),
+        {
+          uid: profile.uid,
+          email: profile.email,
+          displayName: profile.displayName,
+          photoURL: profile.photoURL || null,
+          provider: profile.provider || "password",
+          lastLoginAt: new Date().toISOString(),
+          createdAt: profile.createdAt || new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    } catch (e) {
+      console.warn("Could not sync user profile document:", e);
+    }
+  };
+
   // Initialize storage or auth
   useEffect(() => {
-    // 1. If Firebase Auth is configured, listen to auth state changes
     if (isFirebaseConfigured && auth) {
       const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
         if (firebaseUser) {
+          const providerId = firebaseUser.providerData[0]?.providerId === "google.com" 
+            ? "google.com" 
+            : "password";
+
           const profile: UserProfile = {
             uid: firebaseUser.uid,
             email: firebaseUser.email,
             displayName: firebaseUser.displayName || firebaseUser.email?.split("@")[0] || "User",
             photoURL: firebaseUser.photoURL,
+            provider: providerId,
+            createdAt: firebaseUser.metadata.creationTime || new Date().toISOString(),
+            lastLoginAt: new Date().toISOString(),
             isDemo: false,
           };
           setUser(profile);
+          await saveUserProfileToFirestore(profile);
           await loadFirestoreData(firebaseUser.uid);
         } else {
-          // If no firebase user, check local storage for demo user
           loadLocalFallback();
         }
         setLoading(false);
@@ -78,7 +107,6 @@ export const HabitProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
       return () => unsubscribe();
     } else {
-      // Local demo mode default
       loadLocalFallback();
       setLoading(false);
     }
@@ -93,11 +121,11 @@ export const HabitProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       if (savedUser) {
         setUser(JSON.parse(savedUser));
       } else {
-        // Default to friendly demo user
         const defaultUser: UserProfile = {
           uid: "demo-user-1",
           email: "manas@example.com",
           displayName: "Manas",
+          provider: "demo",
           isDemo: true,
         };
         setUser(defaultUser);
@@ -128,22 +156,19 @@ export const HabitProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const loadFirestoreData = async (uid: string) => {
     if (!db) return;
     try {
-      // Fetch habits from Firestore
       const habitsRef = collection(db, "users", uid, "habits");
       const habitsSnap = await getDocs(habitsRef);
       if (!habitsSnap.empty) {
         const loadedHabits: Habit[] = [];
-        habitsSnap.forEach((doc) => loadedHabits.push(doc.data() as Habit));
+        habitsSnap.forEach((docSnap) => loadedHabits.push(docSnap.data() as Habit));
         setHabits(loadedHabits);
       } else {
-        // Seed default habits into Firestore for new users
         for (const h of DEFAULT_HABITS) {
           await setDoc(doc(db, "users", uid, "habits", h.id), h);
         }
         setHabits(DEFAULT_HABITS);
       }
 
-      // Fetch logs
       const logsRef = collection(db, "users", uid, "logs");
       const logsSnap = await getDocs(logsRef);
       const loadedLogs: Record<string, DayLog> = {};
@@ -157,7 +182,6 @@ export const HabitProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   };
 
-  // Sync to localStorage as backup
   const persistLocally = (newHabits?: Habit[], newLogs?: Record<string, DayLog>) => {
     if (typeof window !== "undefined") {
       if (newHabits) localStorage.setItem("habit_items", JSON.stringify(newHabits));
@@ -252,27 +276,64 @@ export const HabitProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   };
 
   const loginWithEmail = async (email: string, pass: string) => {
-    if (!auth) throw new Error("Firebase is not configured yet. You can use Demo Mode or configure .env.local.");
-    await signInWithEmailAndPassword(auth, email, pass);
-  };
-
-  const signupWithEmail = async (email: string, pass: string, name: string) => {
-    if (!auth) throw new Error("Firebase is not configured yet. You can use Demo Mode or configure .env.local.");
-    const cred = await createUserWithEmailAndPassword(auth, email, pass);
+    if (!auth) throw new Error("Firebase Auth is not ready.");
+    const cred = await signInWithEmailAndPassword(auth, email.trim(), pass);
     if (cred.user) {
-      await updateProfile(cred.user, { displayName: name });
-      setUser({
+      const profile: UserProfile = {
         uid: cred.user.uid,
         email: cred.user.email,
-        displayName: name,
+        displayName: cred.user.displayName || cred.user.email?.split("@")[0] || "User",
+        photoURL: cred.user.photoURL,
+        provider: "password",
+        lastLoginAt: new Date().toISOString(),
         isDemo: false,
-      });
+      };
+      setUser(profile);
+      await saveUserProfileToFirestore(profile);
     }
   };
 
+  const signupWithEmail = async (email: string, pass: string, name: string) => {
+    if (!auth) throw new Error("Firebase Auth is not ready.");
+    const cred = await createUserWithEmailAndPassword(auth, email.trim(), pass);
+    if (cred.user) {
+      await updateProfile(cred.user, { displayName: name.trim() });
+      const profile: UserProfile = {
+        uid: cred.user.uid,
+        email: cred.user.email,
+        displayName: name.trim(),
+        photoURL: cred.user.photoURL,
+        provider: "password",
+        createdAt: new Date().toISOString(),
+        lastLoginAt: new Date().toISOString(),
+        isDemo: false,
+      };
+      setUser(profile);
+      await saveUserProfileToFirestore(profile);
+    }
+  };
+
+  const sendPasswordReset = async (email: string) => {
+    if (!auth) throw new Error("Firebase Auth is not ready.");
+    await sendPasswordResetEmail(auth, email.trim());
+  };
+
   const loginWithGoogle = async () => {
-    if (!auth || !googleProvider) throw new Error("Firebase is not configured yet.");
-    await signInWithPopup(auth, googleProvider);
+    if (!auth || !googleProvider) throw new Error("Firebase Auth is not ready.");
+    const cred = await signInWithPopup(auth, googleProvider);
+    if (cred.user) {
+      const profile: UserProfile = {
+        uid: cred.user.uid,
+        email: cred.user.email,
+        displayName: cred.user.displayName || "User",
+        photoURL: cred.user.photoURL,
+        provider: "google.com",
+        lastLoginAt: new Date().toISOString(),
+        isDemo: false,
+      };
+      setUser(profile);
+      await saveUserProfileToFirestore(profile);
+    }
   };
 
   const loginAsDemo = (name = "Manas") => {
@@ -280,6 +341,7 @@ export const HabitProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       uid: "demo-user-1",
       email: `${name.toLowerCase()}@habittracker.local`,
       displayName: name,
+      provider: "demo",
       isDemo: true,
     };
     setUser(demoUser);
@@ -300,11 +362,9 @@ export const HabitProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     let best = 0;
     let temp = 0;
 
-    // Check backwards from today for current streak
     let checkDate = new Date(today);
     let checking = true;
 
-    // If today is not completed yet, allow streak to continue from yesterday
     const todayStr = checkDate.toISOString().split("T")[0];
     const todayCompleted = logs[todayStr]?.completedHabitIds.includes(habitId);
     if (!todayCompleted) {
@@ -335,14 +395,12 @@ export const HabitProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const totalHabits = habits.length;
     const todayCompletionRate = totalHabits > 0 ? Math.round((completedToday / totalHabits) * 100) : 0;
 
-    // Calculate streaks across all habits
     let overallStreak = 0;
     let d = new Date();
     for (let i = 0; i < 365; i++) {
       const dStr = d.toISOString().split("T")[0];
       const dayLog = logs[dStr];
       const count = dayLog?.completedHabitIds.length || 0;
-      // If at least 1 habit completed on that day
       if (count > 0) {
         overallStreak++;
       } else if (i > 0) {
@@ -351,7 +409,6 @@ export const HabitProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       d.setDate(d.getDate() - 1);
     }
 
-    // Yearly completions
     let totalCompletionsThisYear = 0;
     const currentYear = new Date().getFullYear().toString();
     Object.keys(logs).forEach((dateKey) => {
@@ -392,6 +449,7 @@ export const HabitProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setDayMoodAndTags,
         loginWithEmail,
         signupWithEmail,
+        sendPasswordReset,
         loginWithGoogle,
         loginAsDemo,
         logout,

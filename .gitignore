@@ -44,3 +44,7 @@ next-env.d.ts
 .firebase/
 firestore-debug.log
 firebase-debug.log
+
+# service account credentials
+sa-key.json
+*-key.json
